@@ -68,18 +68,21 @@ const auth0 = {
   callbackUrl: AUTH0_CALLBACK_URL,
 }
 
-const redirectUrl = state => `${auth0.domain}/authorize?response_type=code&client_id=${auth0.clientId}&redirect_uri=${auth0.callbackUrl}&scope=openid%20profile%20email&state=${encodeURIComponent(state)}`
+const redirectUrl = (state) =>
+  `${auth0.domain}/authorize?response_type=code&client_id=${auth0.clientId}&redirect_uri=${
+    auth0.callbackUrl
+  }&scope=openid%20profile%20email&state=${encodeURIComponent(state)}`
 
-const generateStateParam = () => "stub"
+const generateStateParam = () => 'stub'
 
-const verify = async event => {
+const verify = async (event) => {
   // Verify a user based on an auth cookie and Workers KV data
   return { accessToken: '123' }
 }
 
 // Returns an array with the format
 //   [authorized, context]
-export const authorize = async event => {
+export const authorize = async (event) => {
   const authorization = await verify(event)
   if (authorization.accessToken) {
     return [true, { authorization }]
@@ -200,7 +203,7 @@ The `handleRedirect` function, which we'll export from `workers-site/auth0.js`, 
 ```js
 // workers-site/auth0.js
 
-export const handleRedirect = async event => {
+export const handleRedirect = async (event) => {
   const url = new URL(event.request.url)
 
   const state = url.searchParams.get('state')
@@ -225,7 +228,7 @@ Let's define `exchangeCode`, which will take the `code` parameter, and make a re
 
 ```js
 // workers-site/auth0.js
-const exchangeCode = async code => {
+const exchangeCode = async (code) => {
   const body = JSON.stringify({
     grant_type: 'authorization_code',
     client_id: auth0.clientId,
@@ -252,7 +255,7 @@ Next we'll define the `persistAuth` function to handle the request and parse the
 ```js
 // workers-site/auth0.js
 
-const persistAuth = async exchange => {
+const persistAuth = async (exchange) => {
   const body = await exchange.json()
 
   if (body.error) {
@@ -263,17 +266,14 @@ const persistAuth = async exchange => {
 }
 ```
 
-The `body` object - assuming no errors -  will contain an `access_token`, `id_token`, and [other fields](https://auth0.com/docs/flows/guides/auth-code/add-login-auth-code#request-tokens) that we should persist inside of Workers KV, a key-value store that we can access inside of our Workers scripts. When we store data inside Workers KV we need to persist it using a key. The `id_token` field, which is returned by Auth0, is a [JSON Web Token](https://jwt.io/) that contains a `sub` field, a unique identifier for each user. We'll decode the JSON Web Token and parse it into an object:
+The `body` object - assuming no errors - will contain an `access_token`, `id_token`, and [other fields](https://auth0.com/docs/flows/guides/auth-code/add-login-auth-code#request-tokens) that we should persist inside of Workers KV, a key-value store that we can access inside of our Workers scripts. When we store data inside Workers KV we need to persist it using a key. The `id_token` field, which is returned by Auth0, is a [JSON Web Token](https://jwt.io/) that contains a `sub` field, a unique identifier for each user. We'll decode the JSON Web Token and parse it into an object:
 
 ```js
 // workers-site/auth0.js
 
 // https://github.com/pose/webcrypto-jwt/blob/master/workers-site/index.js
-const decodeJWT = function(token) {
-  var output = token
-    .split('.')[1]
-    .replace(/-/g, '+')
-    .replace(/_/g, '/')
+const decodeJWT = function (token) {
+  var output = token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/')
   switch (output.length % 4) {
     case 0:
       break
@@ -297,7 +297,7 @@ const decodeJWT = function(token) {
   }
 }
 
-const persistAuth = async exchange => {
+const persistAuth = async (exchange) => {
   const body = await exchange.json()
 
   if (body.error) {
@@ -308,10 +308,70 @@ const persistAuth = async exchange => {
 }
 ```
 
-With the decoded JWT available, we can hash and salt the `sub` value and use it as a unique identifier for the current user. To do this, we'll use the [Web Crypto API](https://developer.mozilla.org/en-US/docs/Web/API/Web_Crypto_API) available inside the Workers runtime. We'll combine the `SALT` value, a secret that we'll set later in the tutorial, with the `sub` value. By creating a SHA-256 digest of these combined strings, we can then use it as the key for storing the user's JWT in Workers KV:
+While this will allow us to work with the `id_token` returned by Auth0 as a plain JavaScript object, we also need to make sure that the token itself is valid. We can do this by inspecting the `decoded` token, and checking a number of values inside of it to ensure they're correct. To do this, we'll create a new function, `validateToken`, and implement a set of checks as defined by the [OpenID Connect Core 1.0 spec](https://openid.net/specs/openid-connect-core-1_0.html#IDTokenValidation):
 
 ```js
-const persistAuth = async exchange => {
+const validateToken = (token) => {
+  try {
+    const dateInSecs = (d) => Math.ceil(Number(d) / 1000)
+    const date = new Date()
+
+    let iss = token.iss
+
+    // ISS can include a trailing slash but should otherwise be identical to
+    // the AUTH0_DOMAIN, so we should remove the trailing slash if it exists
+    iss = iss.endsWith('/') ? iss.slice(0, -1) : iss
+
+    if (iss !== AUTH0_DOMAIN) {
+      throw new Error(`Token iss value (${iss}) doesn't match AUTH0_DOMAIN (${AUTH0_DOMAIN})`)
+    }
+
+    if (token.aud !== AUTH0_CLIENT_ID) {
+      throw new Error(
+        `Token aud value (${token.aud}) doesn't match AUTH0_CLIENT_ID (${AUTH0_CLIENT_ID})`
+      )
+    }
+
+    if (token.exp < dateInSecs(date)) {
+      throw new Error(`Token exp value is before current time`)
+    }
+
+    // Token should have been issued within the last day
+    date.setDate(date.getDate() - 1)
+    if (token.iat < dateInSecs(date)) {
+      throw new Error(`Token was issued before one day ago and is now invalid`)
+    }
+
+    return true
+  } catch (err) {
+    console.log(err.message)
+    return false
+  }
+}
+```
+
+We can now pass `decoded` token to `validataeToken`, and if it returns `false`, return an object with a status code of [401 Unauthorized](https://httpstatuses.com/401):
+
+```js
+const persistAuth = async (exchange) => {
+  const body = await exchange.json()
+
+  if (body.error) {
+    throw new Error(body.error)
+  }
+
+  const decoded = JSON.parse(decodeJWT(body.id_token))
+  const validToken = validateToken(decoded)
+  if (!validToken) {
+    return { status: 401 }
+  }
+}
+```
+
+With the token validated and decoded, we can hash and salt the `sub` value inside of it and use it as a unique identifier for the current user. To do this, we'll use the [Web Crypto API](https://developer.mozilla.org/en-US/docs/Web/API/Web_Crypto_API) available inside the Workers runtime. We'll combine the `SALT` value, a secret that we'll set later in the tutorial, with the `sub` value. By creating a SHA-256 digest of these combined strings, we can then use it as the key for storing the user's JWT in Workers KV:
+
+```js
+const persistAuth = async (exchange) => {
   // ...
 
   const text = new TextEncoder().encode(`${SALT}-${decoded.sub}`)
@@ -332,7 +392,7 @@ This cookie will be used as we fill out the `verify` function defined earlier in
 
 const cookieKey = 'AUTH0-AUTH'
 
-const persistAuth = async exchange => {
+const persistAuth = async (exchange) => {
   // previous code
 
   const date = new Date()
@@ -358,7 +418,7 @@ async function handleEvent(event) {
     if (url.pathname === '/auth') {
       const authorizedResponse = await handleRedirect(event)
       if (!authorizedResponse) {
-        return new Response("Unauthorized", { status: 401 })
+        return new Response('Unauthorized', { status: 401 })
       }
       response = new Response(response.body, {
         response,
@@ -375,7 +435,7 @@ async function handleEvent(event) {
 
 ## Implementing CSRF protection
 
-To correctly protect against CSRF attacks, our application needs to provide a `state` parameter to the Auth0 login URL. When the user logs in and is redirected back to our application, we can compare the `state` parameter in the redirect URL to our previous piece of `state`, confirming that the user is beginning and ending the login flow via our application. 
+To correctly protect against CSRF attacks, our application needs to provide a `state` parameter to the Auth0 login URL. When the user logs in and is redirected back to our application, we can compare the `state` parameter in the redirect URL to our previous piece of `state`, confirming that the user is beginning and ending the login flow via our application.
 
 We'll generate this piece of state using `csprng.xyz`, a Cloudflare API service for generating random data. The API endpoint `csprng.xyz/v1/api` returns a JSON object with the key `Data` that we'll use as the random value:
 
@@ -393,7 +453,7 @@ To persist this random data, we'll use KV, persisting it for one day (86,400 sec
 // workers-site/auth0.js
 
 const generateStateParam = async () => {
-  const resp = await fetch("https://csprng.xyz/v1/api")
+  const resp = await fetch('https://csprng.xyz/v1/api')
   const { Data: state } = await resp.json()
   await AUTH_STORE.put(`state-${state}`, true, { expirationTtl: 86400 })
   return state
@@ -417,7 +477,7 @@ In `workers-site/auth0.js`, we can begin to flesh out the contents of the `verif
 
 import cookie from 'cookie'
 
-const verify = async event => {
+const verify = async (event) => {
   const cookieHeader = event.request.headers.get('Cookie')
   if (cookieHeader && cookieHeader.includes(cookieKey)) {
     const cookies = cookie.parse(cookieHeader)
@@ -433,7 +493,7 @@ With the unique ID `sub` parsed from the `Cookie` header, we can use it to retri
 ```js
 // workers-site/auth0.js
 
-const verify = async event => {
+const verify = async (event) => {
   const cookieHeader = event.request.headers.get('Cookie')
   if (cookieHeader && cookieHeader.includes(cookieKey)) {
     const cookies = cookie.parse(cookieHeader)
@@ -459,11 +519,10 @@ const verify = async event => {
 
 Finally, we'll decode the `idToken` stored in KV. This includes the `profile` and `email` scopes we requested from Auth0 when the user logged in, which we'll return as `userInfo`, along with `accessToken` and `idToken`:
 
-
 ```js
 // workers-site/auth0.js
 
-const verify = async event => {
+const verify = async (event) => {
   const cookieHeader = event.request.headers.get('Cookie')
   if (cookieHeader && cookieHeader.includes(cookieKey)) {
     const cookies = cookie.parse(cookieHeader)
@@ -495,7 +554,7 @@ As a recap, this `verify` function will now correctly verify our application's u
 ```js
 // workers-site/auth0.js
 
-export const authorize = async event => {
+export const authorize = async (event) => {
   const authorization = await verify(event)
   if (authorization.accessToken) {
     return [true, { authorization }]
@@ -518,7 +577,7 @@ In the previous section of the tutorial, we made a request to Auth0's `/userinfo
 
 ```js
 const hydrateState = (state = {}) => ({
-  element: head => {
+  element: (head) => {
     const jsonState = JSON.stringify(state)
     const scriptTag = `<script id="edge_state" type="application/json">${jsonState}</script>`
     head.append(scriptTag, { html: true })
@@ -529,16 +588,14 @@ async function handleEvent(event) {
   try {
     // BEGINNING OF WORKERS SITES
     // Note the addition of the `await` keyword
-    response = await getAssetFromKV(event);
+    response = await getAssetFromKV(event)
     // END OF WORKERS SITES
 
     // Remove the line of code below
     // return response
 
     // BEGINNING OF STATE HYDRATION CODE BLOCK
-    return new HTMLRewriter()
-      .on('head', hydrateState(authorization.userInfo))
-      .transform(response)
+    return new HTMLRewriter().on('head', hydrateState(authorization.userInfo)).transform(response)
     // END OF STATE HYDRATION CODE BLOCK
   }
   // ...
@@ -556,7 +613,7 @@ While a user's authentication cookie expires after a day, you may want to offer 
 ```js
 // workers-site/auth0.js
 
-export const logout = event => {
+export const logout = (event) => {
   const cookieHeader = event.request.headers.get('Cookie')
   if (cookieHeader && cookieHeader.includes(cookieKey)) {
     return {
